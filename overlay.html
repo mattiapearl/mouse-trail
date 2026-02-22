@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mouse Trail Overlay</title>
+<style>
+  * { margin: 0; padding: 0; }
+  body { background: transparent; overflow: hidden; }
+  canvas { display: block; }
+
+  #controls {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background: rgba(0,0,0,0.85);
+    color: #fff;
+    padding: 14px 18px;
+    border-radius: 8px;
+    font: 13px/1.6 system-ui, sans-serif;
+    z-index: 10;
+    min-width: 220px;
+    display: none;
+  }
+  #controls.visible { display: block; }
+  #controls label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  #controls label span { min-width: 70px; }
+  #controls input[type=range] { width: 90px; }
+  #controls input[type=color] { width: 32px; height: 24px; border: none; cursor: pointer; }
+  #controls select {
+    background: #333; color: #fff; border: 1px solid #555;
+    border-radius: 3px; padding: 2px 4px; font-size: 12px;
+  }
+  #controls button {
+    margin-top: 4px;
+    padding: 4px 10px;
+    background: #444;
+    color: #fff;
+    border: 1px solid #666;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  #controls button:hover { background: #555; }
+  #controls hr { border: none; border-top: 1px solid #555; margin: 8px 0; }
+
+  #exportBox {
+    margin-top: 8px;
+    background: #222;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font: 11px/1.4 monospace;
+    color: #0fa;
+    word-break: break-all;
+    max-height: 80px;
+    overflow-y: auto;
+    display: none;
+    user-select: all;
+    cursor: text;
+  }
+  #exportBox.visible { display: block; }
+  #copied {
+    color: #0fa;
+    font-size: 11px;
+    margin-left: 6px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  #status {
+    position: fixed;
+    bottom: 8px;
+    right: 8px;
+    font: 11px system-ui;
+    color: rgba(255,255,255,0.5);
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="controls">
+  <label><span>Width</span> <input type="range" id="lineWidth" min="1" max="20" value="3"></label>
+  <label><span>Opacity</span> <input type="range" id="opacity" min="1" max="100" value="80"></label>
+  <label><span>Fade (s)</span> <input type="range" id="fade" min="0" max="30" value="5"></label>
+  <label><span>Color</span> <input type="color" id="color" value="#00ffaa"></label>
+  <label><span>Glow</span> <input type="range" id="glow" min="0" max="30" value="6"></label>
+  <label><span>Scale</span> <input type="range" id="scale" min="10" max="300" value="100"></label>
+  <hr>
+  <label><span>Camera</span> <input type="range" id="camFollow" min="1" max="100" value="40"></label>
+  <hr>
+  <label><span>Preset</span>
+    <select id="preset">
+      <option value="neon">Neon</option>
+      <option value="pen">Pen</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="dimTrail"> Dim Trail</label>
+  <label><input type="checkbox" id="instafade"> Instafade</label>
+  <label><input type="checkbox" id="cursorOnly"> Cursor Only</label>
+  <label><input type="checkbox" id="endpointsMode"> Endpoints</label>
+  <label><input type="checkbox" id="arrowMode"> Arrow</label>
+  <hr>
+  <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <button id="clearBtn">Clear</button>
+    <button id="toggleBtn">Disable</button>
+    <button id="exportBtn">Export URL</button><span id="copied"></span>
+  </div>
+  <div id="exportBox"></div>
+</div>
+<div id="status">disconnected &middot; press F7 for controls</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// --- Config ---
+let cfg = {
+  lineWidth: 3,
+  opacity: 0.8,
+  fadeTime: 5,
+  color: '#00ffaa',
+  glow: 6,
+  scale: 1.0,
+  camFollow: 40,     // 1-100: how tightly the camera follows the pen
+  enabled: true,
+  wsUrl: 'ws://localhost:8765',
+  preset: 'neon',      // 'pen' | 'neon'
+  dimTrail: false,     // older segments dimmer based on recency
+  instafade: false,    // override fade to ~0.3s for a short comet tail
+  cursorOnly: false,   // show only a dot at current pen position
+  endpoints: false,    // one line per WS batch instead of every delta
+  arrow: false         // draw direction arrow at current pen position
+};
+
+let savedFadeTime = cfg.fadeTime;  // store user's fade before instafade overrides
+
+// --- State ---
+// Pen position in world-space (accumulates raw deltas forever, never recentered)
+let penX = 0, penY = 0;
+// Camera position in world-space (smoothly follows pen)
+let camX = 0, camY = 0;
+// Segments stored in world-space coordinates
+let segments = [];
+let ws = null;
+let lastFrameTime = performance.now() / 1000;
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// --- URL params ---
+const params = new URLSearchParams(window.location.search);
+function applyParams() {
+  if (params.has('port'))    cfg.wsUrl = `ws://localhost:${params.get('port')}`;
+  if (params.has('color'))   cfg.color = '#' + params.get('color');
+  if (params.has('width'))   cfg.lineWidth = +params.get('width');
+  if (params.has('fade'))    cfg.fadeTime = +params.get('fade');
+  if (params.has('glow'))    cfg.glow = +params.get('glow');
+  if (params.has('scale'))   cfg.scale = +params.get('scale') / 100;
+  if (params.has('opacity')) cfg.opacity = +params.get('opacity') / 100;
+  if (params.has('cam'))     cfg.camFollow = +params.get('cam');
+  if (params.has('enabled')) cfg.enabled = params.get('enabled') !== '0';
+  if (params.has('preset'))  cfg.preset = params.get('preset');
+  if (params.has('dim'))     cfg.dimTrail = params.get('dim') === '1';
+  if (params.has('instafade')) cfg.instafade = params.get('instafade') === '1';
+  if (params.has('cursor'))  cfg.cursorOnly = params.get('cursor') === '1';
+  if (params.has('endpts'))  cfg.endpoints = params.get('endpts') === '1';
+  if (params.has('arrow'))   cfg.arrow = params.get('arrow') === '1';
+}
+applyParams();
+
+// Apply preset defaults (after URL params so preset param works on load)
+function applyPreset(name, syncAfter) {
+  cfg.preset = name;
+  if (name === 'pen') {
+    cfg.lineWidth = 1; cfg.glow = 0; cfg.opacity = 1.0; cfg.dimTrail = true;
+  } else {
+    cfg.lineWidth = 3; cfg.glow = 6; cfg.opacity = 0.8; cfg.dimTrail = false;
+  }
+  if (syncAfter) syncControls();
+}
+// Only apply preset on load if it was explicitly set via URL
+if (params.has('preset')) applyPreset(cfg.preset, false);
+// Apply instafade on load if set via URL
+if (cfg.instafade) {
+  savedFadeTime = cfg.fadeTime;
+  cfg.fadeTime = 0.3;
+}
+
+// Sync controls
+function syncControls() {
+  document.getElementById('lineWidth').value = cfg.lineWidth;
+  document.getElementById('opacity').value = Math.round(cfg.opacity * 100);
+  document.getElementById('fade').value = cfg.fadeTime;
+  document.getElementById('color').value = cfg.color;
+  document.getElementById('glow').value = cfg.glow;
+  document.getElementById('scale').value = Math.round(cfg.scale * 100);
+  document.getElementById('camFollow').value = cfg.camFollow;
+  document.getElementById('toggleBtn').textContent = cfg.enabled ? 'Disable' : 'Enable';
+  document.getElementById('preset').value = cfg.preset;
+  document.getElementById('dimTrail').checked = cfg.dimTrail;
+  document.getElementById('instafade').checked = cfg.instafade;
+  document.getElementById('cursorOnly').checked = cfg.cursorOnly;
+  document.getElementById('endpointsMode').checked = cfg.endpoints;
+  document.getElementById('arrowMode').checked = cfg.arrow;
+}
+syncControls();
+
+// --- Controls ---
+document.getElementById('lineWidth').oninput = e => cfg.lineWidth = +e.target.value;
+document.getElementById('opacity').oninput = e => cfg.opacity = +e.target.value / 100;
+document.getElementById('fade').oninput = e => {
+  cfg.fadeTime = +e.target.value;
+  if (!cfg.instafade) savedFadeTime = cfg.fadeTime;
+};
+document.getElementById('color').oninput = e => cfg.color = e.target.value;
+document.getElementById('glow').oninput = e => cfg.glow = +e.target.value;
+document.getElementById('scale').oninput = e => cfg.scale = +e.target.value / 100;
+document.getElementById('camFollow').oninput = e => cfg.camFollow = +e.target.value;
+document.getElementById('preset').onchange = e => applyPreset(e.target.value, true);
+document.getElementById('dimTrail').onchange = e => cfg.dimTrail = e.target.checked;
+document.getElementById('instafade').onchange = e => {
+  cfg.instafade = e.target.checked;
+  if (cfg.instafade) {
+    savedFadeTime = cfg.fadeTime;
+    cfg.fadeTime = 0.3;
+  } else {
+    cfg.fadeTime = savedFadeTime;
+  }
+  syncControls();
+};
+document.getElementById('cursorOnly').onchange = e => cfg.cursorOnly = e.target.checked;
+document.getElementById('endpointsMode').onchange = e => cfg.endpoints = e.target.checked;
+document.getElementById('arrowMode').onchange = e => cfg.arrow = e.target.checked;
+document.getElementById('clearBtn').onclick = () => { segments = []; penX = 0; penY = 0; camX = 0; camY = 0; };
+document.getElementById('toggleBtn').onclick = e => {
+  cfg.enabled = !cfg.enabled;
+  e.target.textContent = cfg.enabled ? 'Disable' : 'Enable';
+};
+
+// --- Export ---
+function buildExportUrl() {
+  const base = window.location.origin + window.location.pathname;
+  const p = new URLSearchParams();
+  p.set('width', cfg.lineWidth);
+  p.set('opacity', Math.round(cfg.opacity * 100));
+  p.set('fade', cfg.fadeTime);
+  p.set('color', cfg.color.replace('#', ''));
+  p.set('glow', cfg.glow);
+  p.set('scale', Math.round(cfg.scale * 100));
+  p.set('cam', cfg.camFollow);
+  p.set('preset', cfg.preset);
+  if (cfg.dimTrail)   p.set('dim', '1');
+  if (cfg.instafade)  p.set('instafade', '1');
+  if (cfg.cursorOnly) p.set('cursor', '1');
+  if (cfg.endpoints)  p.set('endpts', '1');
+  if (cfg.arrow)      p.set('arrow', '1');
+  p.set('hideui', '1');
+  return base + '?' + p.toString();
+}
+
+document.getElementById('exportBtn').onclick = () => {
+  const url = buildExportUrl();
+  const box = document.getElementById('exportBox');
+  box.textContent = url;
+  box.classList.add('visible');
+  navigator.clipboard.writeText(url).then(() => {
+    const tag = document.getElementById('copied');
+    tag.textContent = 'copied!';
+    tag.style.opacity = '1';
+    setTimeout(() => { tag.style.opacity = '0'; }, 1500);
+  }).catch(() => {});
+};
+
+// Toggle controls with F7
+document.addEventListener('keydown', e => {
+  if (e.key === 'F7') document.getElementById('controls').classList.toggle('visible');
+});
+
+// --- WebSocket ---
+function connect() {
+  if (ws && ws.readyState <= 1) return;
+  ws = new WebSocket(cfg.wsUrl);
+  ws.onopen = () => {
+    document.getElementById('status').textContent = 'connected \u00b7 press F7 for controls';
+  };
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'disconnected \u00b7 press F7 for controls';
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = e => {
+    if (!cfg.enabled) return;
+    const data = JSON.parse(e.data);
+    if (!data.deltas) return;
+    const now = performance.now() / 1000;
+    if (cfg.endpoints) {
+      // Store only one segment per batch: start→end
+      const batchStartX = penX, batchStartY = penY;
+      for (const [dx, dy] of data.deltas) {
+        penX += dx * cfg.scale;
+        penY += dy * cfg.scale;
+      }
+      segments.push({ x1: batchStartX, y1: batchStartY, x2: penX, y2: penY, t: now });
+    } else {
+      for (const [dx, dy] of data.deltas) {
+        const sdx = dx * cfg.scale;
+        const sdy = dy * cfg.scale;
+        const nx = penX + sdx;
+        const ny = penY + sdy;
+        segments.push({ x1: penX, y1: penY, x2: nx, y2: ny, t: now });
+        penX = nx;
+        penY = ny;
+      }
+    }
+  };
+}
+connect();
+
+// --- Render ---
+function hexToRgb(hex) {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+}
+
+function draw() {
+  requestAnimationFrame(draw);
+
+  const now = performance.now() / 1000;
+  const dt = Math.min(now - lastFrameTime, 0.1);
+  lastFrameTime = now;
+
+  // --- Camera follows pen (frame-rate independent lerp) ---
+  const rate = cfg.camFollow / 100;
+  const factor = 1 - Math.pow(1 - rate, dt * 60);
+  camX += (penX - camX) * factor;
+  camY += (penY - camY) * factor;
+
+  // Offset to transform world-space → screen-space
+  // Camera position maps to canvas center
+  const offX = canvas.width / 2 - camX;
+  const offY = canvas.height / 2 - camY;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const [r, g, b] = hexToRgb(cfg.color);
+
+  // Prune old segments
+  if (cfg.fadeTime > 0) {
+    segments = segments.filter(s => (now - s.t) < cfg.fadeTime);
+  }
+  if (segments.length > 10000) {
+    segments = segments.slice(-8000);
+  }
+
+  if (cfg.glow > 0) {
+    ctx.shadowColor = cfg.color;
+    ctx.shadowBlur = cfg.glow;
+  } else {
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = cfg.lineWidth;
+
+  if (cfg.cursorOnly) {
+    // Draw only a dot at current pen position
+    const dotR = cfg.lineWidth * 2;
+    ctx.fillStyle = `rgba(${r},${g},${b},${cfg.opacity})`;
+    ctx.beginPath();
+    ctx.arc(penX + offX, penY + offY, dotR, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    const segLen = segments.length;
+    for (let i = 0; i < segLen; i++) {
+      const s = segments[i];
+      let alpha = cfg.opacity;
+      if (cfg.fadeTime > 0) {
+        const age = now - s.t;
+        alpha *= Math.max(0, 1 - age / cfg.fadeTime);
+      }
+      if (cfg.dimTrail && segLen > 1) {
+        alpha *= 0.05 + 0.95 * (i / (segLen - 1));
+      }
+      if (alpha <= 0) continue;
+
+      ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(s.x1 + offX, s.y1 + offY);
+      ctx.lineTo(s.x2 + offX, s.y2 + offY);
+      ctx.stroke();
+    }
+  }
+
+  // --- Direction arrow at pen position ---
+  if (cfg.arrow && segments.length > 0) {
+    // Average direction from last few segments for smoothness
+    const lookback = Math.min(segments.length, 8);
+    let dx = 0, dy = 0;
+    for (let i = segments.length - lookback; i < segments.length; i++) {
+      const s = segments[i];
+      dx += s.x2 - s.x1;
+      dy += s.y2 - s.y1;
+    }
+    const mag = Math.sqrt(dx * dx + dy * dy);
+    if (mag > 0.1) {
+      const angle = Math.atan2(dy, dx);
+      const size = cfg.lineWidth * 4 + 6;
+      const sx = penX + offX;
+      const sy = penY + offY;
+
+      ctx.save();
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = `rgba(${r},${g},${b},${cfg.opacity})`;
+      ctx.translate(sx, sy);
+      ctx.rotate(angle);
+      ctx.beginPath();
+      ctx.moveTo(size, 0);
+      ctx.lineTo(-size * 0.5, -size * 0.6);
+      ctx.lineTo(-size * 0.5, size * 0.6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+draw();
+</script>
+</body>
+</html>
