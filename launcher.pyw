@@ -8,6 +8,7 @@ from tkinter import ttk, colorchooser
 import subprocess
 import sys
 import os
+from urllib.parse import urlparse, parse_qs
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OVERLAY_PATH = os.path.join(SCRIPT_DIR, "overlay.html")
@@ -154,6 +155,8 @@ class LauncherApp:
                                     command=self._toggle_server)
         self.start_btn.pack(side="left", padx=4)
 
+        ttk.Button(btn_frame, text="Import URL", command=self._import_url).pack(side="left", padx=4)
+
         self.status_label = ttk.Label(btn_frame, text="stopped", foreground="#ff5555")
         self.status_label.pack(side="left", padx=12)
 
@@ -196,6 +199,86 @@ class LauncherApp:
         self.root.clipboard_append(self.obs_path_var.get())
         self.copy_label.configure(text="Copied!", foreground="#00ffaa")
         self.root.after(1500, lambda: self.copy_label.configure(text=""))
+
+    def _import_url(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Import URL")
+        dlg.configure(bg="#1a1a2e")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Paste an OBS Browser Source URL:").pack(padx=12, pady=(12, 4), anchor="w")
+
+        url_entry = tk.Entry(dlg, font=("Consolas", 9), fg="#00ffaa", bg="#111",
+                             insertbackground="#00ffaa", width=70)
+        url_entry.pack(padx=12, pady=4, fill="x")
+
+        # Pre-fill from clipboard if it looks like a relevant URL
+        try:
+            clip = self.root.clipboard_get()
+            if "overlay.html" in clip:
+                url_entry.insert(0, clip)
+        except Exception:
+            pass
+
+        status = ttk.Label(dlg, text="", style="Sub.TLabel")
+        status.pack(padx=12, anchor="w")
+
+        def apply():
+            url = url_entry.get().strip()
+            if not url:
+                return
+            try:
+                self._apply_url_params(url)
+                dlg.destroy()
+            except Exception as e:
+                status.configure(text=f"Error: {e}", foreground="#ff5555")
+
+        bf = ttk.Frame(dlg)
+        bf.pack(padx=12, pady=(4, 12), fill="x")
+        ttk.Button(bf, text="Import", command=apply).pack(side="right", padx=4)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+
+        url_entry.focus_set()
+        dlg.bind("<Return>", lambda e: apply())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _apply_url_params(self, url):
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+
+        def get(key):
+            vals = params.get(key)
+            return vals[0] if vals else None
+
+        if get("port"):
+            self.port_var.set(get("port"))
+        if get("color"):
+            color = "#" + get("color").lstrip("#")
+            self.color_var.set(color)
+            self.color_btn.configure(bg=color)
+        if get("width"):
+            self.width_var.set(int(get("width")))
+        if get("opacity"):
+            self.opacity_var.set(int(get("opacity")))
+        if get("glow"):
+            self.glow_var.set(int(get("glow")))
+        if get("fade"):
+            self.fade_var.set(int(get("fade")))
+        if get("scale"):
+            self.scale_var.set(int(get("scale")))
+        if get("cam"):
+            self.cam_var.set(int(get("cam")))
+        if get("preset"):
+            self.preset_var.set(get("preset"))
+
+        # Boolean flags: present with "1" = true, otherwise false
+        self.dim_var.set(get("dim") == "1")
+        self.instafade_var.set(get("instafade") == "1")
+        self.cursor_var.set(get("cursor") == "1")
+        self.endpts_var.set(get("endpts") == "1")
+        self.arrow_var.set(get("arrow") == "1")
 
     def _toggle_server(self):
         if self.server_proc and self.server_proc.poll() is None:
